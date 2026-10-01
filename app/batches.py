@@ -43,3 +43,27 @@ def compute_digest(payload: dict) -> str:
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
+
+
+def merge_batch_observations(batch_rows: list[dict]) -> list[dict]:
+    """把连续批次的明细观测合并为一次判定的观测序列。
+
+    入参 ``batch_rows`` 每项为 ``{sequence, observations}``，其中
+    ``observations`` 为 ``[{captured_at, local_id}, …]``（批内已按
+    ``(captured_at, local_id)`` 严格递增）。合并以
+    ``(captured_at, sequence, local_id)`` 为全序键跨批排序：不同批次同一时刻
+    的观测以序号区分先后，同一批内保持采集顺序。完全相同的三元组只保留一条
+    （防御性去重：链式追加的批次间 local_id 不应重复）。
+
+    返回 ``[{captured_at, local_id, sequence}, …]``：判定只取时间戳，
+    来源三元组随判定来源一起保存，归档后仍可复核每条观测来自哪一批。
+    """
+    triples: list[tuple[float, int, str]] = []
+    for row in batch_rows:
+        for o in row["observations"]:
+            triples.append((o["captured_at"], row["sequence"], o["local_id"]))
+    triples = sorted(set(triples))
+    return [
+        {"captured_at": t, "sequence": seq, "local_id": local_id}
+        for t, seq, local_id in triples
+    ]

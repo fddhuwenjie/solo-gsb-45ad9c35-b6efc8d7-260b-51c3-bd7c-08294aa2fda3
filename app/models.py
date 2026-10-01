@@ -245,6 +245,40 @@ class BatchAckRequest(BaseModel):
         return s
 
 
+class BatchJudgmentRequest(BaseModel):
+    """对设备连续批次区间创建一次归档前巡检判定（携带客户端幂等键）。
+
+    服务在请求开始固定当前激活特征库版本，确认 ``from_sequence..to_sequence``
+    序号连续、批次明细仍在（无墓碑、无缺批次）且各批保存的四项阈值完全一致，
+    再按 ``(captured_at, sequence, local_id)`` 合并观测，复用现有 /judge 规则
+    判定并保存不可变来源。相同幂等键重试返回原判定（HTTP 200）；相同键改范围
+    或换设备返回 409。
+    """
+
+    idempotency_key: str = Field(
+        min_length=1,
+        max_length=128,
+        description="客户端生成的幂等键（全局唯一；同键重试返回原判定）",
+    )
+    from_sequence: int = Field(ge=1, description="判定区间起始批次序号（含）")
+    to_sequence: int = Field(ge=1, description="判定区间结束批次序号（含）")
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _key_non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("idempotency_key must not be blank")
+        return v
+
+    @model_validator(mode="after")
+    def _ordered_range(self) -> "BatchJudgmentRequest":
+        if self.from_sequence > self.to_sequence:
+            raise ValueError(
+                f"from_sequence {self.from_sequence} must be <= to_sequence {self.to_sequence}"
+            )
+        return self
+
+
 class ArchiveRequest(BaseModel):
     """归档设备批次链的连续前缀。
 

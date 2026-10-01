@@ -55,6 +55,17 @@
 不新增批次、不推进链头、不改写首次受理响应。写锁 + BEGIN IMMEDIATE +
 唯一约束保证并发提交串行化，不会形成分叉、不会丢失重放计数。
 
+连续批次归档前巡检判定：
+
+- ``batch_judgments``：一次区间判定的不可变来源——全局唯一幂等键、设备、
+  起止序号、固定的 ``library_version``、合并观测与四项阈值、底层
+  ``judgments.id``；
+- ``batch_judgment_batches``：区间内各批的摘要（序号、batch_id、前序/本批
+  摘要、条数）。创建在单个 BEGIN IMMEDIATE 事务内完成幂等检查、区间校验
+  （缺批次/墓碑/阈值不一致整体拒绝）、固定激活版本、判定与落库；同键重试
+  返回原判定，改范围/换设备 409；与上传/归档共用写锁串行点，已保存结果
+  不会引用半个范围，且批次随后归档不影响已保存来源的复核。
+
 首次启动时把旧版平铺 ``aids`` 表整体迁移为初始激活版本（source='migration'），
 并给 ``judgments`` 表补充 ``library_version`` 列；同时为旧库的批次表补充
 ``replay_count`` / ``last_replayed_at`` / ``archived_at`` 列（明细列改为
@@ -73,7 +84,7 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .batches import canonical_payload, compute_digest
+from .batches import canonical_payload, compute_digest, merge_batch_observations
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS library_versions (
@@ -195,6 +206,31 @@ CREATE TABLE IF NOT EXISTS replay_report_items (
 );
 CREATE INDEX IF NOT EXISTS idx_replay_items_cursor
     ON replay_report_items (report_id, judgment_id);
+CREATE TABLE IF NOT EXISTS batch_judgments (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key  TEXT NOT NULL UNIQUE,
+    device_id        TEXT NOT NULL,
+    from_sequence    INTEGER NOT NULL,
+    to_sequence      INTEGER NOT NULL,
+    library_version  INTEGER,
+    observation_count INTEGER NOT NULL,
+    thresholds       TEXT NOT NULL,
+    observations     TEXT NOT NULL,
+    judgment_id      INTEGER NOT NULL REFERENCES judgments(id),
+    created_at       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_batch_judgments_device
+    ON batch_judgments (device_id, id);
+CREATE TABLE IF NOT EXISTS batch_judgment_batches (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_judgment_id INTEGER NOT NULL REFERENCES batch_judgments(id),
+    sequence          INTEGER NOT NULL,
+    batch_id          TEXT NOT NULL,
+    previous_digest   TEXT NOT NULL,
+    digest            TEXT NOT NULL,
+    observation_count INTEGER NOT NULL,
+    UNIQUE (batch_judgment_id, sequence)
+);
 """
 
 
@@ -280,6 +316,15 @@ class ArchiveConflict(Exception):
     def __init__(self, *, message: str, **extra):
         super().__init__(message)
         self.detail = {"error": "archive_conflict", "message": message}
+        self.detail.update(extra)
+
+
+class BatchJudgmentConflict(Exception):
+    """连续批次判定冲突（HTTP 409）：范围非法或幂等键已被其他范围/设备占用。"""
+
+    def __init__(self, *, message: str, **extra):
+        super().__init__(message)
+        self.detail = {"error": "batch_judgment_conflict", "message": message}
         self.detail.update(extra)
 
 
@@ -652,6 +697,20 @@ class Database:
                 conn.rollback()  # 只读事务，释放读锁
         return vid, aids
 
+    @staticmethod
+    def _active_snapshot_of(conn) -> tuple[int | None, list[dict]]:
+        """在给定连接（可为写事务中的连接）内取当前激活版本号与完整快照。
+
+        连续批次判定在写事务内调用：事务持写锁期间激活版本不可能被其他请求
+        切换，故判定自请求开始固定的 ``library_version`` 与最终保存值严格
+        同快照。
+        """
+        state = conn.execute(
+            "SELECT version_id FROM library_state WHERE id = 1"
+        ).fetchone()
+        vid = state["version_id"] if state is not None else None
+        return vid, Database._aids_of(conn, vid) if vid is not None else []
+
     # ---------------- 判定记录 ----------------
 
     def save_judgment(
@@ -668,25 +727,53 @@ class Database:
         response: dict,
     ) -> int:
         with self._write_tx() as conn:
-            cur = conn.execute(
-                "INSERT INTO judgments "
-                "(created_at, status, best_aid_id, matched, missed, false_count, drift, "
-                "library_version, request, response) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    time.time(),
-                    status,
-                    best_aid_id,
-                    matched,
-                    missed,
-                    false_count,
-                    drift,
-                    library_version,
-                    json.dumps(request, ensure_ascii=False),
-                    json.dumps(response, ensure_ascii=False),
-                ),
+            return self._insert_judgment(
+                conn,
+                status=status,
+                best_aid_id=best_aid_id,
+                matched=matched,
+                missed=missed,
+                false_count=false_count,
+                drift=drift,
+                library_version=library_version,
+                request=request,
+                response=response,
             )
-            return int(cur.lastrowid)
+
+    @staticmethod
+    def _insert_judgment(
+        conn,
+        *,
+        status: str,
+        best_aid_id: str | None,
+        matched: int,
+        missed: int,
+        false_count: int,
+        drift: float | None,
+        library_version: int | None,
+        request: dict,
+        response: dict,
+    ) -> int:
+        """在给定连接（可为其他写事务中的连接）内插入一条判定记录并返回其 id。"""
+        cur = conn.execute(
+            "INSERT INTO judgments "
+            "(created_at, status, best_aid_id, matched, missed, false_count, drift, "
+            "library_version, request, response) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                time.time(),
+                status,
+                best_aid_id,
+                matched,
+                missed,
+                false_count,
+                drift,
+                library_version,
+                json.dumps(request, ensure_ascii=False),
+                json.dumps(response, ensure_ascii=False),
+            ),
+        )
+        return int(cur.lastrowid)
 
     def list_judgments(self, limit: int = 50, offset: int = 0) -> list[dict]:
         with closing(self._connect()) as conn:
@@ -1733,4 +1820,341 @@ class Database:
             "count": len(items),
             "changes": items,
             "next_cursor": items[-1]["judgment_id"] if has_more and items else None,
+        }
+
+    # ---------------- 连续批次归档前巡检判定 ----------------
+
+    def create_batch_judgment(
+        self,
+        device_id: str,
+        idempotency_key: str,
+        from_sequence: int,
+        to_sequence: int,
+        runner,
+    ) -> tuple[dict, bool]:
+        """对设备连续批次区间创建一次归档前巡检判定（单事务，幂等）。
+
+        整个流程在单个 BEGIN IMMEDIATE 事务内完成，写锁与上传/归档/激活共用
+        同一串行点：
+
+        1. 幂等键检查：相同键 + 相同设备/范围重试返回原判定
+           （``created=False``，HTTP 200）；相同键但设备或范围不同抛
+           :class:`BatchJudgmentConflict`（HTTP 409）；
+        2. 区间校验：``from_sequence..to_sequence`` 内每个序号都必须存在、
+           且明细仍在（非墓碑）。范围含墓碑抛 ``range_archived``，含缺批次
+           抛 ``range_not_continuous``——两种情况整体拒绝，不落任何记录；
+        3. 各批保存的 /judge 四项阈值必须完全一致，否则抛
+           ``thresholds_mismatch``（同样整体拒绝）；
+        4. 在同一事务内固定当前激活特征库版本与快照（持锁期间版本不可能被
+           切换），按 ``(captured_at, sequence, local_id)`` 合并观测，由
+           调用方注入的 ``runner`` 复用与 /judge 完全相同的判定算法；
+        5. 判定结果写入 ``judgments``（可被 /judgments 与草稿回放复核），
+           再保存 ``batch_judgments``（幂等键、设备、序号范围、
+           ``library_version``、合并观测与阈值、judgment_id）与各批摘要
+           （``batch_judgment_batches``）作为不可变来源。
+        """
+        now = time.time()
+        with self._write_tx() as conn:
+            existing = conn.execute(
+                "SELECT id FROM batch_judgments WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                saved = self._get_batch_judgment(conn, int(existing["id"]))
+                if (
+                    saved is not None
+                    and saved["device_id"] == device_id
+                    and saved["from_sequence"] == from_sequence
+                    and saved["to_sequence"] == to_sequence
+                ):
+                    return saved, False
+                raise BatchJudgmentConflict(
+                    message=(
+                        f"idempotency_key {idempotency_key!r} is already used by a "
+                        f"batch judgment of device {saved['device_id']!r} range "
+                        f"{saved['from_sequence']}..{saved['to_sequence']}"
+                    ),
+                    reason="idempotency_key_in_use",
+                    idempotency_key=idempotency_key,
+                    occupied_by_batch_judgment_id=saved["batch_judgment_id"],
+                    occupied_device_id=saved["device_id"],
+                    occupied_from_sequence=saved["from_sequence"],
+                    occupied_to_sequence=saved["to_sequence"],
+                )
+
+            rows = conn.execute(
+                "SELECT sequence, batch_id, previous_digest, digest, "
+                "observation_count, thresholds, observations, archived_at "
+                "FROM device_batches "
+                "WHERE device_id = ? AND sequence >= ? AND sequence <= ? "
+                "ORDER BY sequence",
+                (device_id, from_sequence, to_sequence),
+            ).fetchall()
+            chain = conn.execute(
+                "SELECT last_sequence FROM device_chains WHERE device_id = ?",
+                (device_id,),
+            ).fetchone()
+            head_sequence = chain["last_sequence"] if chain is not None else 0
+
+            by_seq = {r["sequence"]: r for r in rows}
+            missing = [
+                s for s in range(from_sequence, to_sequence + 1) if s not in by_seq
+            ]
+            if missing:
+                raise BatchJudgmentConflict(
+                    message=(
+                        f"cannot judge range {from_sequence}..{to_sequence}: "
+                        f"missing batch sequence(s) {', '.join(map(str, missing))}"
+                    ),
+                    reason="range_not_continuous",
+                    device_id=device_id,
+                    from_sequence=from_sequence,
+                    to_sequence=to_sequence,
+                    head_sequence=head_sequence,
+                    missing_sequences=missing,
+                )
+            archived = [
+                r["sequence"]
+                for r in rows
+                if r["archived_at"] is not None or r["observations"] is None
+            ]
+            if archived:
+                raise BatchJudgmentConflict(
+                    message=(
+                        f"cannot judge range {from_sequence}..{to_sequence}: "
+                        f"batch sequence(s) {', '.join(map(str, archived))} are "
+                        "archived tombstones without observations"
+                    ),
+                    reason="range_archived",
+                    device_id=device_id,
+                    from_sequence=from_sequence,
+                    to_sequence=to_sequence,
+                    archived_sequences=archived,
+                )
+
+            thresholds = json.loads(rows[0]["thresholds"])
+            mismatched: list[int] = []
+            for r in rows[1:]:
+                if json.loads(r["thresholds"]) != thresholds:
+                    mismatched.append(r["sequence"])
+            if mismatched:
+                raise BatchJudgmentConflict(
+                    message=(
+                        "all batches in the range must share the exact same /judge "
+                        "thresholds (tolerance/max_drift/max_missed/max_false); "
+                        f"sequence(s) {', '.join(map(str, mismatched))} differ from "
+                        f"sequence {from_sequence}"
+                    ),
+                    reason="thresholds_mismatch",
+                    device_id=device_id,
+                    from_sequence=from_sequence,
+                    to_sequence=to_sequence,
+                    reference_sequence=from_sequence,
+                    mismatched_sequences=mismatched,
+                )
+
+            batch_details = [
+                {
+                    "sequence": r["sequence"],
+                    "observations": json.loads(r["observations"]),
+                }
+                for r in rows
+            ]
+            merged = merge_batch_observations(batch_details)
+            timestamps = [o["captured_at"] for o in merged]
+
+            # 持写锁固定激活版本：判定与保存之间不可能发生版本切换
+            library_version, aids = self._active_snapshot_of(conn)
+            request_payload, response_payload = runner(
+                timestamps, thresholds, library_version, aids
+            )
+
+            # 保存点：若唯一约束兜底发现同键已被并发请求占用（多 worker 下
+            # 可能越过进程内写锁串行），回滚本请求已写的 judgments 行，
+            # 绝不留下孤儿判定或半个范围
+            conn.execute("SAVEPOINT batch_judgment_insert")
+            judgment_id = self._insert_judgment(
+                conn,
+                status=response_payload["status"],
+                best_aid_id=response_payload["best"]
+                and response_payload["best"]["aid_id"],
+                matched=response_payload["best"]["matched"]
+                if response_payload["best"] is not None
+                else 0,
+                missed=response_payload["best"]["missed"]
+                if response_payload["best"] is not None
+                else 0,
+                false_count=response_payload["best"]["false"]
+                if response_payload["best"] is not None
+                else 0,
+                drift=response_payload["best"]["drift"]
+                if response_payload["best"] is not None
+                else None,
+                library_version=library_version,
+                request=request_payload,
+                response=response_payload,
+            )
+            response_payload["judgment_id"] = judgment_id
+
+            try:
+                cur = conn.execute(
+                    "INSERT INTO batch_judgments "
+                    "(idempotency_key, device_id, from_sequence, to_sequence, "
+                    "library_version, observation_count, thresholds, observations, "
+                    "judgment_id, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        device_id,
+                        from_sequence,
+                        to_sequence,
+                        library_version,
+                        len(merged),
+                        json.dumps(thresholds, ensure_ascii=False),
+                        json.dumps(merged, ensure_ascii=False),
+                        judgment_id,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # 唯一约束兜底并发同键：写锁通常已串行化到上面的 SELECT；
+                # 多 worker 下若仍有并发事务抢先占用该键，撤销本请求写入
+                conn.execute("ROLLBACK TO SAVEPOINT batch_judgment_insert")
+                rival = conn.execute(
+                    "SELECT * FROM batch_judgments WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                saved = self._get_batch_judgment(conn, int(rival["id"]))
+                if (
+                    saved is not None
+                    and saved["device_id"] == device_id
+                    and saved["from_sequence"] == from_sequence
+                    and saved["to_sequence"] == to_sequence
+                ):
+                    return saved, False
+                raise BatchJudgmentConflict(
+                    message=(
+                        f"idempotency_key {idempotency_key!r} is already used by a "
+                        f"batch judgment of device {saved['device_id']!r} range "
+                        f"{saved['from_sequence']}..{saved['to_sequence']}"
+                    ),
+                    reason="idempotency_key_in_use",
+                    idempotency_key=idempotency_key,
+                    occupied_by_batch_judgment_id=saved["batch_judgment_id"],
+                    occupied_device_id=saved["device_id"],
+                    occupied_from_sequence=saved["from_sequence"],
+                    occupied_to_sequence=saved["to_sequence"],
+                )
+            conn.execute("RELEASE SAVEPOINT batch_judgment_insert")
+            batch_judgment_id = int(cur.lastrowid)
+            conn.executemany(
+                "INSERT INTO batch_judgment_batches "
+                "(batch_judgment_id, sequence, batch_id, previous_digest, digest, "
+                "observation_count) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        batch_judgment_id,
+                        r["sequence"],
+                        r["batch_id"],
+                        r["previous_digest"],
+                        r["digest"],
+                        r["observation_count"],
+                    )
+                    for r in rows
+                ],
+            )
+            saved = self._get_batch_judgment(conn, batch_judgment_id)
+        return saved, True
+
+    @staticmethod
+    def _batch_judgment_batches(conn, batch_judgment_id: int) -> list[dict]:
+        rows = conn.execute(
+            "SELECT sequence, batch_id, previous_digest, digest, observation_count "
+            "FROM batch_judgment_batches WHERE batch_judgment_id = ? ORDER BY sequence",
+            (batch_judgment_id,),
+        ).fetchall()
+        return [
+            {
+                "sequence": r["sequence"],
+                "batch_id": r["batch_id"],
+                "previous_digest": r["previous_digest"],
+                "digest": r["digest"],
+                "observation_count": r["observation_count"],
+            }
+            for r in rows
+        ]
+
+    def _get_batch_judgment(self, conn, batch_judgment_id: int) -> dict | None:
+        """在给定连接内组装一次连续批次判定的完整不可变来源。"""
+        r = conn.execute(
+            "SELECT * FROM batch_judgments WHERE id = ?", (batch_judgment_id,)
+        ).fetchone()
+        if r is None:
+            return None
+        judgment = conn.execute(
+            "SELECT response FROM judgments WHERE id = ?", (r["judgment_id"],)
+        ).fetchone()
+        judgment_payload = (
+            json.loads(judgment["response"]) if judgment is not None else None
+        )
+        if judgment_payload is not None:
+            # judgments 保存的是回填 id 前的响应（同 GET /judgments/{id}），
+            # 这里补上来源判定 id 便于直接复核
+            judgment_payload["judgment_id"] = r["judgment_id"]
+        return {
+            "batch_judgment_id": r["id"],
+            "idempotency_key": r["idempotency_key"],
+            "device_id": r["device_id"],
+            "from_sequence": r["from_sequence"],
+            "to_sequence": r["to_sequence"],
+            "library_version": r["library_version"],
+            "observation_count": r["observation_count"],
+            "thresholds": json.loads(r["thresholds"]),
+            "observations": json.loads(r["observations"]),
+            "source_judgment_id": r["judgment_id"],
+            "created_at": _iso(r["created_at"]),
+            "batches": self._batch_judgment_batches(conn, r["id"]),
+            "judgment": judgment_payload,
+        }
+
+    def get_batch_judgment(self, device_id: str, batch_judgment_id: int) -> dict | None:
+        """查询一次连续批次判定的完整来源；不属于该设备或不存在返回 None（404）。"""
+        with closing(self._connect()) as conn:
+            found = self._get_batch_judgment(conn, batch_judgment_id)
+        if found is None or found["device_id"] != device_id:
+            return None
+        return found
+
+    def list_batch_judgments(
+        self, device_id: str, *, after_id: int = 0, limit: int = 50
+    ) -> dict:
+        """按 id 游标分页列出设备的连续批次判定（升序，仅摘要，不含判定证据）。"""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM batch_judgments "
+                "WHERE device_id = ? AND id > ? ORDER BY id LIMIT ?",
+                (device_id, after_id, limit + 1),
+            ).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        items = [
+            {
+                "batch_judgment_id": r["id"],
+                "idempotency_key": r["idempotency_key"],
+                "device_id": r["device_id"],
+                "from_sequence": r["from_sequence"],
+                "to_sequence": r["to_sequence"],
+                "library_version": r["library_version"],
+                "observation_count": r["observation_count"],
+                "thresholds": json.loads(r["thresholds"]),
+                "source_judgment_id": r["judgment_id"],
+                "created_at": _iso(r["created_at"]),
+            }
+            for r in rows
+        ]
+        return {
+            "device_id": device_id,
+            "count": len(items),
+            "batch_judgments": items,
+            "next_cursor": items[-1]["batch_judgment_id"] if has_more and items else None,
         }

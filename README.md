@@ -51,6 +51,17 @@
 次数（载荷变化仍 409）；归档之后登记的新消费者从 `archived_through` 起步，
 其首个缺口直接指向归档前缀的下一批。
 
+连续批次在归档前可形成一次**可复核的巡检判定**
+（`POST /field-devices/{device_id}/batch-judgments`）：请求携带客户端幂等键与
+起止 `sequence`，服务在同一写事务开始时固定当前激活特征库版本，确认区间内
+**序号连续、批次明细仍在（无墓碑、无缺批次）、各批保存的四项阈值完全一致**，
+再按 `(captured_at, sequence, local_id)` 合并全部观测并复用现有 `/judge` 规则
+判定，保存 `judgment_id` 及设备、序号范围、各批摘要与 `library_version` 作为
+**不可变来源**。相同键重试返回原判定（HTTP 200）；相同键改范围或换设备返回
+409；范围含墓碑、缺批次或阈值不一致时**整体拒绝且不落判定**。写锁串行化保证
+归档或上传并发不会使已保存结果引用半个范围；批次随后归档，已保存的判定来源
+仍可完整查询。
+
 ## 快速开始
 
 单条命令启动（唯一前置要求：Docker 与 Docker Compose）：
@@ -108,6 +119,9 @@ SQLite 数据通过命名卷 `navlight-data` 持久化。
 | `POST` | `/field-devices/{device_id}/acknowledgments` | 消费者确认已处理批次（`consumer_id`/`sequence`/`batch_digest`；乱序/并发/重复安全，冲突 409） |
 | `GET` | `/field-devices/{device_id}/archive-status` | 查询安全归档水位：`safe_sequence`、`archived_through`、首个缺口、各消费者水位与阻塞消费者 |
 | `POST` | `/field-devices/{device_id}/archive` | 归档连续前缀：清空 `sequence ≤ through_sequence` 的明细载荷（目标须 ≤ 同事务 `safe_sequence`，越界 409；重复/更小目标幂等） |
+| `POST` | `/field-devices/{device_id}/batch-judgments` | 对连续批次区间创建归档前巡检判定（幂等键；固定激活库版本，合并观测复用 `/judge`；重试 200，改范围/设备 409，含墓碑/缺批次/阈值不一致整体拒绝） |
+| `GET` | `/field-devices/{device_id}/batch-judgments` | 分页查询设备的连续批次判定（`after_id` 游标 + `limit`） |
+| `GET` | `/field-devices/{device_id}/batch-judgments/{id}` | 查询单次连续批次判定详情（不可变来源：序号范围、各批摘要、合并观测、阈值、`library_version`、判定结果） |
 
 ### 1. 导入特征库（原子发布新版本）
 
@@ -745,6 +759,123 @@ curl -s -X POST $DEV/archive -H 'Content-Type: application/json' \
 列表、详情、游标与 `archive-status` 均返回 `archived_through`；墓碑在列表
 与详情中均明确标注 `status="archived"`（另有布尔字段 `archived`）。
 
+### 9. 连续批次归档前巡检判定（一次可复核的判定来源）
+
+现场设备上传的连续批次在**归档之前**，可按设备与起止 `sequence` 形成一次
+可复核的巡检判定——把多批观测合并为一条序列，用与 `/judge` 完全相同的规则
+裁决，并把区间、各批摘要、合并观测、阈值、激活库版本与底层判定 id 固化为
+**不可变来源**；批次随后归档（明细被清空）也不影响已保存判定的复核。
+
+**请求体**：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `idempotency_key` | `string`（1~128） | 客户端生成的幂等键（全局唯一；网络重试复用同一键） |
+| `from_sequence` | `int≥1` | 判定区间起始批次序号（含），不得大于 `to_sequence` |
+| `to_sequence` | `int≥1` | 判定区间结束批次序号（含） |
+
+服务在**同一个写事务**内串行完成校验、固定版本、判定与落库：
+
+1. **幂等键**：相同键 + 相同设备/范围重试直接返回原判定
+   （HTTP 200，`batch_judgment_id` / `source_judgment_id` / `created_at`
+   均不变）；相同键被**其他设备或其他范围**占用时返回 409，`detail` 给出
+   `occupied_device_id` / `occupied_from_sequence` /
+   `occupied_to_sequence` / `occupied_by_batch_judgment_id`；
+2. **区间前置校验**（任一不满足即整体 409 拒绝，**不落任何判定**）：
+   - `range_not_continuous`：区间内存在缺失序号，`detail.missing_sequences`
+     与 `head_sequence` 列出缺口与当前链头；
+   - `range_archived`：区间内有序号已是归档墓碑（明细不在），
+     `detail.archived_sequences` 列出墓碑序号；
+   - `thresholds_mismatch`：各批保存的四项阈值
+     （`tolerance` / `max_drift` / `max_missed` / `max_false`）不完全一致，
+     `detail.reference_sequence` / `mismatched_sequences` 给出基准与分歧批次；
+3. **固定激活版本**：在持写锁的事务内读取当前激活特征库版本与完整快照，
+   判定与保存之间不可能发生版本切换；响应与记录中的 `library_version`
+   即本次判定固定的版本（无激活版本时为 `null`，按无合格候选处理，仍落判定）；
+4. **合并观测**：把各批观测按 `(captured_at, sequence, local_id)` 全局排序
+   合并——不同批次同一时刻的观测以序号区分先后，同一批内保持采集顺序；
+   判定只取时间戳序列，合并后的每条观测同时保留来源 `sequence` 以便复核；
+5. **复用 /judge**：以各批共同的四项阈值执行与 `/judge` 完全相同的判定
+   算法（`library_source="stored"`），结果写入 `judgments`（可在
+   `GET /judgments/{id}` 与草稿回放报告中复核），再保存本次连续批次判定的
+   不可变来源。
+
+```bash
+DEV=http://localhost:8000/field-devices/dev-01
+
+# 先确认批次 1..3 已上传（观测跨批连续），然后对区间创建判定
+curl -s -X POST $DEV/batch-judgments \
+  -H 'Content-Type: application/json' \
+  -d '{"idempotency_key": "dev-01-1-3-2026-10-01",
+       "from_sequence": 1, "to_sequence": 3}'
+```
+
+```json
+{
+  "batch_judgment_id": 1,
+  "idempotency_key": "dev-01-1-3-2026-10-01",
+  "device_id": "dev-01",
+  "from_sequence": 1,
+  "to_sequence": 3,
+  "library_version": 2,
+  "observation_count": 12,
+  "thresholds": {"tolerance": 0.5, "max_drift": 0.0005, "max_missed": 3, "max_false": 3},
+  "observations": [
+    {"captured_at": 1700000000.0, "sequence": 1, "local_id": "o000"},
+    {"captured_at": 1700000000.5, "sequence": 1, "local_id": "o001"},
+    {"captured_at": 1700000001.0, "sequence": 2, "local_id": "o004"}
+  ],
+  "source_judgment_id": 17,
+  "created_at": "2026-10-01T06:00:00+00:00",
+  "batches": [
+    {"sequence": 1, "batch_id": "b-001", "previous_digest": "",
+     "digest": "49740f…", "observation_count": 4},
+    {"sequence": 2, "batch_id": "b-002", "previous_digest": "49740f…",
+     "digest": "5e7aa3…", "observation_count": 4},
+    {"sequence": 3, "batch_id": "b-003", "previous_digest": "5e7aa3…",
+     "digest": "9c10bd…", "observation_count": 4}
+  ],
+  "judgment": {
+    "status": "matched",
+    "reason": null,
+    "library_source": "stored",
+    "library_version": 2,
+    "observation_count": 12,
+    "parameters": {"tolerance": 0.5, "max_drift": 0.0005, "max_missed": 3, "max_false": 3},
+    "best": {"aid_id": "CN-001", "matched": 12, "missed": 0, "false": 0, "…": "…"},
+    "candidates": [ … ],
+    "judgment_id": 17
+  }
+}
+```
+
+- **重试幂等**：同一 `idempotency_key` 原样重发返回 HTTP 200 与同一份结果，
+  不会重复判定或重复落库；
+- **改范围/换设备 409**：同一键更换 `from_sequence` / `to_sequence` 或设备
+  时返回 409（`reason=idempotency_key_in_use`），换用新键即可；
+- **并发不引用半个范围**：判定与批次上传、前缀归档共用同一写锁串行点
+  （`BEGIN IMMEDIATE`）+ 幂等键唯一约束兜底。判定进行中的归档必须等其提交
+  后才能清空明细；判定进行中的上传要么尚未进入区间（整体 409 拒绝），
+  要么完整进入区间（覆盖全范围）。任何已保存判定都满足
+  `observation_count == Σ batches[].observation_count`，绝不会只引用半个
+  范围；同键并发请求恰好一份 201，其余得到同一份 200；
+- **归档后仍可复核**：区间内批次之后被归档为墓碑，不改变已保存的
+  `observations` / `batches` / `judgment`，按 id 仍可查询完整来源；底层
+  判定行也可经 `source_judgment_id` 在 `GET /judgments/{id}` 回溯，并可被
+  草稿回放报告重放评估。
+
+**结果查询**：
+
+```bash
+# 分页列表（摘要：序号范围、阈值、library_version、source_judgment_id）
+curl -s "$DEV/batch-judgments?limit=20"
+curl -s "$DEV/batch-judgments?after_id=1&limit=20"
+
+# 单次详情：不可变来源（各批摘要 + 合并观测 + 完整判定证据）
+curl -s "$DEV/batch-judgments/1"
+# 不属于该设备的 id 返回 404
+```
+
 ## 判定模型与裁决规则
 
 **观测模型**：观测时钟相对真时存在线性钟漂与固定相位差，
@@ -794,7 +925,7 @@ t_obs ≈ (1 + drift) · T_true + c
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 前缀归档 + 草稿回放共 107 例）
+pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 前缀归档 + 草稿回放 + 连续批次判定共 126 例）
 uvicorn app.main:app --reload   # 本地起服务，默认使用 ./data/navlight.db
 ```
 
@@ -806,11 +937,11 @@ app/
   align.py   相位-钟漂联合估计与循环对齐核心算法
   patrol.py  巡检整体核对：窗口合格候选 + 全局最优分配动态规划
   replay.py  草稿回放：用草稿快照沿用原观测/阈值重放历史判定并四分类
-  batches.py 现场设备批次：规范化载荷与 SHA-256 链式摘要
+  batches.py 现场设备批次：规范化载荷与 SHA-256 链式摘要；跨批观测合并
   models.py  请求数据模型（Pydantic）
   db.py      SQLite 持久层（不可变特征库版本 + 判定记录 + 草稿回放报告 +
-             设备批次链 + 多消费者稀疏确认与安全归档水位 + 连续前缀归档墓碑，
-             含首次迁移）
+             设备批次链 + 多消费者稀疏确认与安全归档水位 + 连续前缀归档墓碑 +
+             连续批次归档前巡检判定不可变来源，含首次迁移）
   config.py  环境变量配置
 samples/
   library.json                示例特征库

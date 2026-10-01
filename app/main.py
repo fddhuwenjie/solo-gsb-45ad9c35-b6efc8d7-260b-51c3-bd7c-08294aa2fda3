@@ -8,6 +8,7 @@ from .align import AidPattern, judge
 from .db import (
     ArchiveConflict,
     BatchConflict,
+    BatchJudgmentConflict,
     BatchNotFound,
     ConsumerConflict,
     Database,
@@ -19,6 +20,7 @@ from .db import (
 from .models import (
     ArchiveRequest,
     BatchAckRequest,
+    BatchJudgmentRequest,
     BatchUploadRequest,
     ConsumerRegisterRequest,
     JudgeRequest,
@@ -29,6 +31,49 @@ from .models import (
 )
 from .patrol import PatrolWaypoint, analyze_patrol
 from .replay import CLASSIFICATIONS, replay_records
+
+
+def _run_judgment(
+    patterns: list,
+    observations: list[float],
+    thresholds: dict,
+    *,
+    library_source: str,
+    library_version: int | None,
+) -> tuple[dict, dict]:
+    """复用现有 /judge 规则执行一次判定，返回待保存的 (request, response)。
+
+    response 不含 ``judgment_id``（由持久层写入 judgments 后回填），与
+    /judge 首次保存前的响应结构完全一致。``patterns`` 为已按本次请求开始
+    时固定的特征库快照构建的候选航标。
+    """
+    best, candidates, reason = judge(
+        patterns,
+        observations,
+        tolerance=thresholds["tolerance"],
+        max_drift=thresholds["max_drift"],
+        max_missed=thresholds["max_missed"],
+        max_false=thresholds["max_false"],
+        grid_max_steps=config.grid_max_steps(),
+        seed_top_k=config.seed_top_k(),
+    )
+    request_payload = {"observations": observations, **thresholds}
+    if library_source == "inline":
+        request_payload["library"] = [
+            {"aid_id": p.aid_id, "period": p.period, "flashes": list(p.flashes)}
+            for p in patterns
+        ]
+    response_payload = {
+        "status": "matched" if best is not None else "no_candidate",
+        "reason": reason,
+        "library_source": library_source,
+        "library_version": library_version,
+        "observation_count": len(observations),
+        "parameters": dict(thresholds),
+        "best": best.to_detail() if best is not None else None,
+        "candidates": [c.to_summary() for c in candidates],
+    }
+    return request_payload, response_payload
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
@@ -52,8 +97,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "草稿上线前可创建回放报告：冻结判定水位，用草稿快照重放水位内服务端"
             "库判定并四分类（unchanged/match_gained/match_lost/winner_changed），"
             "幂等键重试返回原报告、跨版本占用返回 409，回放不写入 judgments。"
+            "设备连续批次归档前可按设备和起止 sequence 创建一次巡检判定："
+            "请求开始固定激活库版本，确认序号连续、明细仍在、各批四项阈值完全"
+            "一致后按 (captured_at, sequence, local_id) 合并观测并复用 /judge "
+            "规则，保存 judgment_id、序号范围、各批摘要与 library_version 作为"
+            "不可变来源；幂等键重试返回原判定、改范围或设备 409，范围含墓碑或"
+            "缺批次整体拒绝，归档/上传并发不会引用半个范围。"
         ),
-        version="1.7.0",
+        version="1.8.0",
     )
     app.state.db = Database(db_path or config.db_path())
 
@@ -261,41 +312,29 @@ def create_app(db_path: str | None = None) -> FastAPI:
             ]
             library_source = "stored"
 
-        best, candidates, reason = judge(
+        thresholds = {
+            "tolerance": req.tolerance,
+            "max_drift": req.max_drift,
+            "max_missed": req.max_missed,
+            "max_false": req.max_false,
+        }
+        request_payload, response = _run_judgment(
             patterns,
             req.observations,
-            tolerance=req.tolerance,
-            max_drift=req.max_drift,
-            max_missed=req.max_missed,
-            max_false=req.max_false,
-            grid_max_steps=config.grid_max_steps(),
-            seed_top_k=config.seed_top_k(),
+            thresholds,
+            library_source=library_source,
+            library_version=library_version,
         )
-
-        response = {
-            "status": "matched" if best is not None else "no_candidate",
-            "reason": reason,
-            "library_source": library_source,
-            "library_version": library_version,
-            "observation_count": len(req.observations),
-            "parameters": {
-                "tolerance": req.tolerance,
-                "max_drift": req.max_drift,
-                "max_missed": req.max_missed,
-                "max_false": req.max_false,
-            },
-            "best": best.to_detail() if best is not None else None,
-            "candidates": [c.to_summary() for c in candidates],
-        }
+        best = response["best"]
         judgment_id = app.state.db.save_judgment(
             status=response["status"],
-            best_aid_id=best.aid_id if best is not None else None,
-            matched=best.matched if best is not None else 0,
-            missed=best.missed if best is not None else 0,
-            false_count=best.false if best is not None else 0,
-            drift=best.drift if best is not None else None,
+            best_aid_id=best["aid_id"] if best is not None else None,
+            matched=best["matched"] if best is not None else 0,
+            missed=best["missed"] if best is not None else 0,
+            false_count=best["false"] if best is not None else 0,
+            drift=best["drift"] if best is not None else None,
             library_version=library_version,
-            request=req.model_dump(),
+            request=request_payload,
             response=response,
         )
         response["judgment_id"] = judgment_id
@@ -582,6 +621,83 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if not created:
             response.status_code = 200
         return body
+
+    # ---------------- 连续批次归档前巡检判定 ----------------
+
+    @app.post(
+        "/field-devices/{device_id}/batch-judgments",
+        status_code=201,
+        summary="对设备连续批次区间创建一次归档前巡检判定（幂等）",
+        description=(
+            "请求携带 idempotency_key 与起止序号。服务在同一写事务开始时固定"
+            "当前激活特征库版本，确认区间内序号连续、批次明细仍在（无墓碑、"
+            "无缺批次）且各批保存的四项阈值完全一致，再按 "
+            "(captured_at, sequence, local_id) 合并观测并复用现有 /judge 规则"
+            "判定，保存 judgment_id 及设备、序号范围、各批摘要与 "
+            "library_version 作为不可变来源。相同幂等键重试返回原判定"
+            "（HTTP 200）；相同键改范围或设备返回 409；范围含墓碑、缺批次或"
+            "阈值不一致时整体拒绝且不落判定。写锁串行化：归档或上传并发不得"
+            "使已保存结果引用半个范围。"
+        ),
+    )
+    def create_device_batch_judgment(
+        req: BatchJudgmentRequest,
+        response: Response,
+        device_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        def runner(observations, thresholds, library_version, stored_aids):
+            # 持写锁固定的库版本快照：与请求开始固定的 library_version 严格同快照
+            patterns = [
+                AidPattern(a["aid_id"], a["period"], tuple(a["flashes"]))
+                for a in stored_aids
+            ]
+            return _run_judgment(
+                patterns,
+                observations,
+                thresholds,
+                library_source="stored",
+                library_version=library_version,
+            )
+
+        try:
+            body, created = app.state.db.create_batch_judgment(
+                device_id,
+                req.idempotency_key,
+                req.from_sequence,
+                req.to_sequence,
+                runner,
+            )
+        except BatchJudgmentConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        if not created:
+            response.status_code = 200
+        return body
+
+    @app.get(
+        "/field-devices/{device_id}/batch-judgments",
+        summary="分页查询设备的连续批次判定（按 id 升序）",
+    )
+    def list_device_batch_judgments(
+        device_id: str = Path(min_length=1, max_length=128),
+        after_id: int = Query(0, ge=0, description="游标：返回 id 大于该值的判定"),
+        limit: int = Query(50, ge=1, le=200),
+    ) -> dict:
+        return app.state.db.list_batch_judgments(
+            device_id, after_id=after_id, limit=limit
+        )
+
+    @app.get(
+        "/field-devices/{device_id}/batch-judgments/{batch_judgment_id}",
+        summary="查询单次连续批次判定详情（不可变来源：序号范围、各批摘要、合并观测与判定）",
+    )
+    def get_device_batch_judgment(
+        device_id: str = Path(min_length=1, max_length=128),
+        batch_judgment_id: int = Path(ge=1),
+    ) -> dict:
+        row = app.state.db.get_batch_judgment(device_id, batch_judgment_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="batch judgment not found")
+        return row
 
     return app
 
