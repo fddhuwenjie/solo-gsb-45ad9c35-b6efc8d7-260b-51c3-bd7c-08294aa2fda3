@@ -55,8 +55,27 @@
 不新增批次、不推进链头、不改写首次受理响应。写锁 + BEGIN IMMEDIATE +
 唯一约束保证并发提交串行化，不会形成分叉、不会丢失重放计数。
 
+连续批次巡检判定（归档前对设备一段连续批次的可复核整体判定）：
+
+- ``judgments.source``：判定来源——普通 ``/judge`` 为 ``judge``，连续批次
+  巡检判定为 ``inspection``（巡检判定复用同一张判定记录表与同一回放口径）；
+- ``device_inspection_judgments``：不可变来源记录——``judgment_id``、设备、
+  序号范围（``from_sequence`` / ``to_sequence``）、创建时各批摘要
+  （序号/批次号/前序摘要/本批摘要/条数快照）与请求开始时固定的
+  ``library_version``，外加全局唯一的客户端幂等键。
+
+创建在单个 BEGIN IMMEDIATE 事务内完成「幂等键校验 → 固定当前激活特征库
+版本 → 校验序号连续/明细仍在（无墓碑）/各批四项阈值完全一致 → 按
+``(captured_at, sequence, local_id)`` 合并观测 → 复用 /judge 规则 →
+写判定记录与不可变来源」。幂等键重试返回原判定（HTTP 200），同键改设备
+或范围返回 409；范围缺批次或含墓碑整体拒绝（409）且不落任何判定。
+归档/上传并发与判定创建共用同一写锁串行点：未通过范围校验前不写任何记录，
+已保存的来源记录永远不会引用半个范围；归档随后清空明细也不影响已保存的
+各批摘要快照。
+
 首次启动时把旧版平铺 ``aids`` 表整体迁移为初始激活版本（source='migration'），
-并给 ``judgments`` 表补充 ``library_version`` 列；同时为旧库的批次表补充
+并给 ``judgments`` 表补充 ``library_version`` 列与 ``source`` 列（既有判定
+回填为 ``judge``）；同时为旧库的批次表补充
 ``replay_count`` / ``last_replayed_at`` / ``archived_at`` 列（明细列改为
 可空以承载归档墓碑）、为链游标表补充最近事件三列与
 ``archived_through`` / ``archived_at`` 列（旧记录重放次数为零、归档水位
@@ -105,6 +124,8 @@ CREATE TABLE IF NOT EXISTS judgments (
     false_count     INTEGER NOT NULL DEFAULT 0,
     drift           REAL,
     library_version INTEGER,
+    source          TEXT NOT NULL DEFAULT 'judge'
+        CHECK (source IN ('judge', 'inspection')),
     request         TEXT NOT NULL,
     response        TEXT NOT NULL
 );
@@ -195,6 +216,21 @@ CREATE TABLE IF NOT EXISTS replay_report_items (
 );
 CREATE INDEX IF NOT EXISTS idx_replay_items_cursor
     ON replay_report_items (report_id, judgment_id);
+CREATE TABLE IF NOT EXISTS device_inspection_judgments (
+    inspection_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    judgment_id     INTEGER NOT NULL UNIQUE REFERENCES judgments(id),
+    device_id       TEXT NOT NULL,
+    from_sequence   INTEGER NOT NULL,
+    to_sequence     INTEGER NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    library_version INTEGER NOT NULL,
+    batch_count     INTEGER NOT NULL,
+    observation_count INTEGER NOT NULL,
+    batches         TEXT NOT NULL,
+    created_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inspection_device_cursor
+    ON device_inspection_judgments (device_id, inspection_id);
 """
 
 
@@ -283,6 +319,19 @@ class ArchiveConflict(Exception):
         self.detail.update(extra)
 
 
+class NoActiveLibrary(Exception):
+    """当前没有激活特征库版本（HTTP 400），巡检判定无法固定 library_version。"""
+
+
+class InspectionConflict(Exception):
+    """巡检判定冲突（HTTP 409）：范围缺批次/含墓碑/阈值不一致，或幂等键被占用。"""
+
+    def __init__(self, *, message: str, **extra):
+        super().__init__(message)
+        self.detail = {"error": "inspection_conflict", "message": message}
+        self.detail.update(extra)
+
+
 def _iso(ts: float | None) -> str | None:
     if ts is None:
         return None
@@ -367,6 +416,12 @@ class Database:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(judgments)")}
         if "library_version" not in cols:
             conn.execute("ALTER TABLE judgments ADD COLUMN library_version INTEGER")
+        if "source" not in cols:
+            # 既有判定记录全部来自 /judge，回填为 judge
+            conn.execute(
+                "ALTER TABLE judgments ADD COLUMN source TEXT NOT NULL "
+                "DEFAULT 'judge'"
+            )
         self._migrate_device_tables(conn)
 
     def _migrate_device_tables(self, conn) -> None:
@@ -654,6 +709,44 @@ class Database:
 
     # ---------------- 判定记录 ----------------
 
+    @staticmethod
+    def _insert_judgment(
+        conn,
+        *,
+        now: float,
+        status: str,
+        best_aid_id: str | None,
+        matched: int,
+        missed: int,
+        false_count: int,
+        drift: float | None,
+        library_version: int | None,
+        request: dict,
+        response: dict,
+        source: str = "judge",
+    ) -> int:
+        """在给定连接（写事务中的连接）上插入一条判定记录，返回新 id。"""
+        cur = conn.execute(
+            "INSERT INTO judgments "
+            "(created_at, status, best_aid_id, matched, missed, false_count, drift, "
+            "library_version, source, request, response) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                now,
+                status,
+                best_aid_id,
+                matched,
+                missed,
+                false_count,
+                drift,
+                library_version,
+                source,
+                json.dumps(request, ensure_ascii=False),
+                json.dumps(response, ensure_ascii=False),
+            ),
+        )
+        return int(cur.lastrowid)
+
     def save_judgment(
         self,
         *,
@@ -666,33 +759,29 @@ class Database:
         library_version: int | None,
         request: dict,
         response: dict,
+        source: str = "judge",
     ) -> int:
         with self._write_tx() as conn:
-            cur = conn.execute(
-                "INSERT INTO judgments "
-                "(created_at, status, best_aid_id, matched, missed, false_count, drift, "
-                "library_version, request, response) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    time.time(),
-                    status,
-                    best_aid_id,
-                    matched,
-                    missed,
-                    false_count,
-                    drift,
-                    library_version,
-                    json.dumps(request, ensure_ascii=False),
-                    json.dumps(response, ensure_ascii=False),
-                ),
+            return self._insert_judgment(
+                conn,
+                now=time.time(),
+                status=status,
+                best_aid_id=best_aid_id,
+                matched=matched,
+                missed=missed,
+                false_count=false_count,
+                drift=drift,
+                library_version=library_version,
+                request=request,
+                response=response,
+                source=source,
             )
-            return int(cur.lastrowid)
 
     def list_judgments(self, limit: int = 50, offset: int = 0) -> list[dict]:
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT id, created_at, status, best_aid_id, matched, missed, false_count, "
-                "drift, library_version "
+                "drift, library_version, source "
                 "FROM judgments ORDER BY id DESC LIMIT ? OFFSET ?",
                 (limit, offset),
             ).fetchall()
@@ -707,6 +796,7 @@ class Database:
                 "false": r["false_count"],
                 "drift": r["drift"],
                 "library_version": r["library_version"],
+                "source": r["source"],
             }
             for r in rows
         ]
@@ -715,7 +805,7 @@ class Database:
         with closing(self._connect()) as conn:
             r = conn.execute(
                 "SELECT id, created_at, status, best_aid_id, matched, missed, false_count, "
-                "drift, library_version, request, response "
+                "drift, library_version, source, request, response "
                 "FROM judgments WHERE id = ?",
                 (judgment_id,),
             ).fetchone()
@@ -731,6 +821,7 @@ class Database:
             "false": r["false_count"],
             "drift": r["drift"],
             "library_version": r["library_version"],
+            "source": r["source"],
             "request": json.loads(r["request"]),
             "response": json.loads(r["response"]),
         }
@@ -1407,6 +1498,411 @@ class Database:
             "blocking_consumers": fields["blocking_consumers"],
             "consumers": fields["consumers"],
         }
+
+    # ---------------- 连续批次巡检判定 ----------------
+
+    @staticmethod
+    def _inspection_summary_row(
+        *,
+        row: sqlite3.Row,
+        status: str | None = None,
+        best_aid_id: str | None = None,
+        matched: int | None = None,
+        missed: int | None = None,
+        false_count: int | None = None,
+        drift: float | None = None,
+    ) -> dict:
+        """巡检判定的摘要行（列表用）：来源元数据 + 裁决摘要。"""
+        summary = {
+            "inspection_id": row["inspection_id"],
+            "judgment_id": row["judgment_id"],
+            "device_id": row["device_id"],
+            "from_sequence": row["from_sequence"],
+            "to_sequence": row["to_sequence"],
+            "idempotency_key": row["idempotency_key"],
+            "library_version": row["library_version"],
+            "batch_count": row["batch_count"],
+            "observation_count": row["observation_count"],
+            "created_at": _iso(row["created_at"]),
+        }
+        if status is not None:
+            summary["status"] = status
+            summary["best_aid_id"] = best_aid_id
+            summary["matched"] = matched
+            summary["missed"] = missed
+            summary["false"] = false_count
+            summary["drift"] = drift
+        return summary
+
+    @staticmethod
+    def _inspection_body(
+        *,
+        record: sqlite3.Row,
+        judgment: sqlite3.Row,
+    ) -> dict:
+        """组装巡检判定完整响应：判定裁决 + 不可变来源（设备/范围/各批摘要/版本）。"""
+        response = json.loads(judgment["response"])
+        # 判定记录内的响应快照不嵌自身 id（与 /judge 一致：id 在落库后回填）
+        response["judgment_id"] = judgment["id"]
+        response["inspection"] = {
+            "inspection_id": record["inspection_id"],
+            "device_id": record["device_id"],
+            "from_sequence": record["from_sequence"],
+            "to_sequence": record["to_sequence"],
+            "idempotency_key": record["idempotency_key"],
+            "batch_count": record["batch_count"],
+            "observation_count": record["observation_count"],
+            "batches": json.loads(record["batches"]),
+            "created_at": _iso(record["created_at"]),
+        }
+        return response
+
+    def create_inspection_judgment(
+        self,
+        device_id: str,
+        from_sequence: int,
+        to_sequence: int,
+        idempotency_key: str,
+        runner,
+    ) -> tuple[dict, bool]:
+        """对设备一段连续批次创建巡检判定；全程在单个 BEGIN IMMEDIATE 事务内。
+
+        步骤（任何前置校验失败都在写入判定记录之前抛出，绝不落半个范围的
+        判定）：
+
+        1. 幂等键：相同键且同设备同范围重试，直接返回原结果
+           （``created=False``，HTTP 200）；相同键但设备或范围不同抛
+           :class:`InspectionConflict`（HTTP 409）；
+        2. 在请求开始固定当前激活特征库版本（事务持写锁，激活切换被串行在
+           本事务之后）；无激活版本抛 :class:`NoActiveLibrary`（HTTP 400）；
+        3. 范围校验：``from_sequence..to_sequence`` 每个序号都必须存在（缺
+           批次返回 409 ``range_missing_batches``），且都必须是明细仍在的
+           非墓碑（含墓碑返回 409 ``range_archived``）；
+        4. 阈值一致性：各批保存的四项阈值必须与首批完全一致，否则返回 409
+           ``threshold_mismatch``（附期望阈值与不一致批次明细）；
+        5. 按 ``(captured_at, sequence, local_id)`` 合并观测，由调用方注入
+           的 ``runner(aids, observations, thresholds)`` 复用 /judge 规则
+           判定（特征库即步骤 2 固定的激活快照）；
+        6. 同事务写入 ``judgments``（source='inspection'）与不可变来源记录
+           （judgment_id、设备、范围、各批摘要快照、library_version）。
+
+        与上传/归档共用写锁串行点：判定进行中归档无法清空范围内明细，已保存
+        结果也不随后续归档改变（各批摘要在创建时即快照保存）。
+        """
+        now = time.time()
+        with self._write_tx() as conn:
+            existing = conn.execute(
+                "SELECT * FROM device_inspection_judgments WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                same_scope = (
+                    existing["device_id"] == device_id
+                    and existing["from_sequence"] == from_sequence
+                    and existing["to_sequence"] == to_sequence
+                )
+                if not same_scope:
+                    raise InspectionConflict(
+                        reason="idempotency_key_in_use",
+                        message=(
+                            f"idempotency_key {idempotency_key!r} is already used by "
+                            f"another inspection judgment (device "
+                            f"{existing['device_id']!r}, sequences "
+                            f"{existing['from_sequence']}..{existing['to_sequence']})"
+                        ),
+                        idempotency_key=idempotency_key,
+                        occupied_by_inspection=existing["inspection_id"],
+                        occupied_by_judgment=existing["judgment_id"],
+                        occupied_device_id=existing["device_id"],
+                        occupied_from_sequence=existing["from_sequence"],
+                        occupied_to_sequence=existing["to_sequence"],
+                    )
+                judgment = conn.execute(
+                    "SELECT * FROM judgments WHERE id = ?",
+                    (existing["judgment_id"],),
+                ).fetchone()
+                return self._inspection_body(record=existing, judgment=judgment), False
+
+            # 请求开始固定当前激活特征库版本（写锁内，整次判定只引用该快照）
+            state = conn.execute(
+                "SELECT version_id FROM library_state WHERE id = 1"
+            ).fetchone()
+            library_version = state["version_id"] if state is not None else None
+            if library_version is None:
+                raise NoActiveLibrary(
+                    "no active library version: import aids via "
+                    "POST /library/import before creating an inspection judgment"
+                )
+
+            rows = conn.execute(
+                "SELECT sequence, batch_id, previous_digest, digest, observation_count, "
+                "thresholds, observations, status, archived_at "
+                "FROM device_batches WHERE device_id = ? AND sequence >= ? AND sequence <= ? "
+                "ORDER BY sequence",
+                (device_id, from_sequence, to_sequence),
+            ).fetchall()
+            present = {r["sequence"] for r in rows}
+            expected = set(range(from_sequence, to_sequence + 1))
+            missing = sorted(expected - present)
+            if missing:
+                raise InspectionConflict(
+                    reason="range_missing_batches",
+                    message=(
+                        f"inspection range {from_sequence}..{to_sequence} of device "
+                        f"{device_id!r} has no batch at sequences: "
+                        f"{', '.join(map(str, missing))}"
+                    ),
+                    device_id=device_id,
+                    from_sequence=from_sequence,
+                    to_sequence=to_sequence,
+                    missing_sequences=missing,
+                )
+            archived_sequences = [
+                r["sequence"] for r in rows if r["archived_at"] is not None
+            ]
+            if archived_sequences:
+                raise InspectionConflict(
+                    reason="range_archived",
+                    message=(
+                        f"inspection range {from_sequence}..{to_sequence} of device "
+                        f"{device_id!r} contains archived batches (tombstones with "
+                        f"cleared observations/thresholds) at sequences: "
+                        f"{', '.join(map(str, archived_sequences))}"
+                    ),
+                    device_id=device_id,
+                    from_sequence=from_sequence,
+                    to_sequence=to_sequence,
+                    archived_sequences=archived_sequences,
+                )
+
+            first_thresholds = json.loads(rows[0]["thresholds"])
+            mismatches = []
+            for r in rows[1:]:
+                thresholds = json.loads(r["thresholds"])
+                differing = sorted(
+                    key
+                    for key in ("tolerance", "max_drift", "max_missed", "max_false")
+                    if thresholds[key] != first_thresholds[key]
+                )
+                if differing:
+                    mismatches.append(
+                        {
+                            "sequence": r["sequence"],
+                            "thresholds": thresholds,
+                            "differing_fields": differing,
+                        }
+                    )
+            if mismatches:
+                raise InspectionConflict(
+                    reason="threshold_mismatch",
+                    message=(
+                        "all batches in the inspection range must carry identical "
+                        "/judge thresholds (tolerance/max_drift/max_missed/max_false)"
+                    ),
+                    device_id=device_id,
+                    from_sequence=from_sequence,
+                    to_sequence=to_sequence,
+                    reference_sequence=from_sequence,
+                    expected_thresholds=first_thresholds,
+                    mismatches=mismatches,
+                )
+
+            batches_for_merge = [
+                {
+                    "sequence": r["sequence"],
+                    "observations": json.loads(r["observations"]),
+                }
+                for r in rows
+            ]
+            from .inspections import merge_observations
+
+            merged = merge_observations(batches_for_merge)
+            observations = [item[0] for item in merged]
+
+            aids = self._aids_of(conn, library_version)
+            outcome = runner(aids, observations, first_thresholds)
+            best = outcome["best"]
+
+            request_payload = {
+                "observations": observations,
+                "tolerance": first_thresholds["tolerance"],
+                "max_drift": first_thresholds["max_drift"],
+                "max_missed": first_thresholds["max_missed"],
+                "max_false": first_thresholds["max_false"],
+                "source": "inspection",
+                "device_id": device_id,
+                "from_sequence": from_sequence,
+                "to_sequence": to_sequence,
+                "idempotency_key": idempotency_key,
+            }
+            response_payload = {
+                "status": outcome["status"],
+                "reason": outcome["reason"],
+                "library_source": "stored",
+                "library_version": library_version,
+                "observation_count": len(observations),
+                "parameters": {
+                    "tolerance": first_thresholds["tolerance"],
+                    "max_drift": first_thresholds["max_drift"],
+                    "max_missed": first_thresholds["max_missed"],
+                    "max_false": first_thresholds["max_false"],
+                },
+                "best": best,
+                "candidates": outcome["candidates"],
+            }
+            # SAVEPOINT 兜底同键并发：若唯一约束被并发抢先占用，只回滚本
+            # 函数内的两次插入（保持外层写事务可用），改按既有记录返回/409
+            conn.execute("SAVEPOINT sp_inspection")
+            judgment_id = self._insert_judgment(
+                conn,
+                now=now,
+                status=outcome["status"],
+                best_aid_id=best["aid_id"] if best is not None else None,
+                matched=best["matched"] if best is not None else 0,
+                missed=best["missed"] if best is not None else 0,
+                false_count=best["false"] if best is not None else 0,
+                drift=best["drift"] if best is not None else None,
+                library_version=library_version,
+                request=request_payload,
+                response=response_payload,
+                source="inspection",
+            )
+
+            batch_summaries = [
+                {
+                    "sequence": r["sequence"],
+                    "batch_id": r["batch_id"],
+                    "previous_digest": r["previous_digest"],
+                    "digest": r["digest"],
+                    "observation_count": r["observation_count"],
+                }
+                for r in rows
+            ]
+            try:
+                cur = conn.execute(
+                    "INSERT INTO device_inspection_judgments "
+                    "(judgment_id, device_id, from_sequence, to_sequence, "
+                    "idempotency_key, library_version, batch_count, observation_count, "
+                    "batches, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        judgment_id,
+                        device_id,
+                        from_sequence,
+                        to_sequence,
+                        idempotency_key,
+                        library_version,
+                        len(rows),
+                        len(observations),
+                        json.dumps(batch_summaries, ensure_ascii=False),
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # 并发兜底：写锁通常已把同键请求串行化到上面的 SELECT；
+                # 若同键并发请求抢先插入，退回当前事务已写的判定记录不会被
+                # 提交——用 SAVEPOINT 仅回滚本函数内的两次插入，再按既有记录
+                # 幂等返回（同设备同范围）或 409（占用范围不同）。
+                conn.execute("ROLLBACK TO sp_inspection")
+                rival = conn.execute(
+                    "SELECT * FROM device_inspection_judgments WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if rival is None:
+                    raise
+                same_scope = (
+                    rival["device_id"] == device_id
+                    and rival["from_sequence"] == from_sequence
+                    and rival["to_sequence"] == to_sequence
+                )
+                if same_scope:
+                    judgment = conn.execute(
+                        "SELECT * FROM judgments WHERE id = ?",
+                        (rival["judgment_id"],),
+                    ).fetchone()
+                    return self._inspection_body(record=rival, judgment=judgment), False
+                raise InspectionConflict(
+                    reason="idempotency_key_in_use",
+                    message=(
+                        f"idempotency_key {idempotency_key!r} is already used by "
+                        f"another inspection judgment (device "
+                        f"{rival['device_id']!r}, sequences "
+                        f"{rival['from_sequence']}..{rival['to_sequence']})"
+                    ),
+                    idempotency_key=idempotency_key,
+                    occupied_by_inspection=rival["inspection_id"],
+                    occupied_by_judgment=rival["judgment_id"],
+                    occupied_device_id=rival["device_id"],
+                    occupied_from_sequence=rival["from_sequence"],
+                    occupied_to_sequence=rival["to_sequence"],
+                )
+            inspection_id = int(cur.lastrowid)
+            record = conn.execute(
+                "SELECT * FROM device_inspection_judgments WHERE inspection_id = ?",
+                (inspection_id,),
+            ).fetchone()
+            judgment = conn.execute(
+                "SELECT * FROM judgments WHERE id = ?", (judgment_id,)
+            ).fetchone()
+            body = self._inspection_body(record=record, judgment=judgment)
+        return body, True
+
+    def list_inspection_judgments(
+        self, device_id: str, *, after_inspection_id: int = 0, limit: int = 50
+    ) -> dict:
+        """按 inspection_id 游标分页列出设备的巡检判定（升序）。
+
+        每条为摘要（来源元数据 + 裁决摘要）；完整响应（含 candidates、
+        合并观测明细）走单条查询接口。
+        """
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT i.*, j.status AS j_status, j.best_aid_id AS j_best_aid_id, "
+                "j.matched AS j_matched, j.missed AS j_missed, "
+                "j.false_count AS j_false_count, j.drift AS j_drift "
+                "FROM device_inspection_judgments i "
+                "JOIN judgments j ON j.id = i.judgment_id "
+                "WHERE i.device_id = ? AND i.inspection_id > ? "
+                "ORDER BY i.inspection_id LIMIT ?",
+                (device_id, after_inspection_id, limit + 1),
+            ).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        items = [
+            self._inspection_summary_row(
+                row=r,
+                status=r["j_status"],
+                best_aid_id=r["j_best_aid_id"],
+                matched=r["j_matched"],
+                missed=r["j_missed"],
+                false_count=r["j_false_count"],
+                drift=r["j_drift"],
+            )
+            for r in rows
+        ]
+        return {
+            "device_id": device_id,
+            "count": len(items),
+            "inspections": items,
+            "next_cursor": items[-1]["inspection_id"] if has_more and items else None,
+        }
+
+    def get_inspection_judgment(self, device_id: str, inspection_id: int) -> dict | None:
+        """读取设备的单条巡检判定完整响应；不属于该设备或不存在返回 None。"""
+        with closing(self._connect()) as conn:
+            record = conn.execute(
+                "SELECT * FROM device_inspection_judgments "
+                "WHERE inspection_id = ? AND device_id = ?",
+                (inspection_id, device_id),
+            ).fetchone()
+            if record is None:
+                return None
+            judgment = conn.execute(
+                "SELECT * FROM judgments WHERE id = ?", (record["judgment_id"],)
+            ).fetchone()
+        if judgment is None:
+            return None
+        return self._inspection_body(record=record, judgment=judgment)
 
     # ---------------- 草稿回放报告 ----------------
 

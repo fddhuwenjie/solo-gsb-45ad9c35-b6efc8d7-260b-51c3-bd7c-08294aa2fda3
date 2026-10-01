@@ -51,6 +51,17 @@
 次数（载荷变化仍 409）；归档之后登记的新消费者从 `archived_through` 起步，
 其首个缺口直接指向归档前缀的下一批。
 
+归档前，连续批次可形成一次**可复核的巡检判定**
+（`POST /field-devices/{device_id}/range-judgments`）：服务在请求开始时
+固定当前激活特征库版本，确认设备 `from_sequence..to_sequence` 序号连续、
+各批明细仍在（不含归档墓碑）且每批保存的 `/judge` 四项阈值完全一致，再按
+`(captured_at, sequence, local_id)` 合并全部观测、复用 `/judge` 规则判定，
+把 `judgment_id`、设备、序号范围、各批摘要与 `library_version` 保存为
+**不可变来源**。请求携带客户端幂等键：相同键重试返回原判定（200），改设备
+或范围返回 409；范围缺批次、含墓碑或阈值不一致时**整体拒绝且不落判定**。
+创建与上传/归档共用同一写锁串行点，并发不会让已保存结果引用半个范围，
+之后归档明细也不改变已保存的各批摘要快照。
+
 ## 快速开始
 
 单条命令启动（唯一前置要求：Docker 与 Docker Compose）：
@@ -108,6 +119,9 @@ SQLite 数据通过命名卷 `navlight-data` 持久化。
 | `POST` | `/field-devices/{device_id}/acknowledgments` | 消费者确认已处理批次（`consumer_id`/`sequence`/`batch_digest`；乱序/并发/重复安全，冲突 409） |
 | `GET` | `/field-devices/{device_id}/archive-status` | 查询安全归档水位：`safe_sequence`、`archived_through`、首个缺口、各消费者水位与阻塞消费者 |
 | `POST` | `/field-devices/{device_id}/archive` | 归档连续前缀：清空 `sequence ≤ through_sequence` 的明细载荷（目标须 ≤ 同事务 `safe_sequence`，越界 409；重复/更小目标幂等） |
+| `POST` | `/field-devices/{device_id}/range-judgments` | 对连续批次创建归档前巡检判定（幂等键；固定激活版本、校验连续/明细/阈值一致后合并观测复用 `/judge`；重试 200，改范围/设备 409） |
+| `GET` | `/field-devices/{device_id}/range-judgments` | 查询设备的巡检判定（`after_inspection_id` 游标分页，按创建顺序） |
+| `GET` | `/field-devices/{device_id}/range-judgments/{id}` | 查询单条巡检判定详情（完整裁决 + 设备/范围/各批摘要/`library_version` 不可变来源） |
 
 ### 1. 导入特征库（原子发布新版本）
 
@@ -309,7 +323,8 @@ curl -s "$BASE/changes?include_skipped=true"
 「建新表 → 拷数据 → 改名」在单事务内重建，唯一约束保留）、为设备链游标表
 补充 `last_event_status` / `last_event_sequence` / `last_event_at` 列
 （回填为链头批次的受理事件）与 `archived_through` / `archived_at` 列
-（回填为 0 / 空）。全新部署则无初始版本，首次 `/library/import` 即创建
+（回填为 0 / 空），并为判定记录补充 `source` 列（既有记录回填为 `judge`）、
+创建连续批次巡检判定来源表。全新部署则无初始版本，首次 `/library/import` 即创建
 版本 1。
 
 ### 3. 判定观测序列
@@ -745,6 +760,104 @@ curl -s -X POST $DEV/archive -H 'Content-Type: application/json' \
 列表、详情、游标与 `archive-status` 均返回 `archived_through`；墓碑在列表
 与详情中均明确标注 `status="archived"`（另有布尔字段 `archived`）。
 
+### 9. 连续批次巡检判定（归档前一次可复核的整体判定）
+
+现场设备上传的连续批次在归档前可整体判定一次：先上传若干链式批次（见 §6，
+每批保存观测时间戳与 `/judge` 四项阈值），再按设备与起止 sequence 创建判定。
+整个流程（固定版本 → 范围校验 → 合并观测 → 判定 → 落库）在**单个 SQLite
+写事务**内完成：
+
+1. **请求开始固定当前激活特征库版本**：事务持写锁读取激活版本号与完整快照，
+   整个判定只引用该版本；即使判定期间有新版本激活，结果与记录的
+   `library_version` 也不受影响。无激活版本返回 400；
+2. **序号连续、明细仍在**：`from_sequence..to_sequence` 的每个序号都必须
+   存在，且都是明细未清空的非墓碑批次。缺批次返回 409
+   （`reason=range_missing_batches`，附 `missing_sequences`）；范围含
+   已归档墓碑返回 409（`reason=range_archived`，附 `archived_sequences`）；
+3. **四项阈值完全一致**：各批保存的 `tolerance` / `max_drift` /
+   `max_missed` / `max_false` 必须与首批逐字段相等，否则返回 409
+   （`reason=threshold_mismatch`，附期望阈值与每个不一致批次的差异字段）；
+4. **合并观测并复用 `/judge` 规则**：全部观测按
+   `(captured_at, sequence, local_id)` 全局升序合并为一条时间戳序列
+   （允许不同批次出现相同时刻，以 sequence、local_id 次序排列，不去重），
+   用固定版本快照执行与 `/judge` 完全相同的判定算法；
+5. **不可变来源落库**：判定本身写入 `judgments`（`source="inspection"`，
+   请求载荷为合并后的观测与四项阈值，可被 §2.5 的草稿回放按水位重放），
+   另在同一事务保存来源记录——`judgment_id`、`device_id`、
+   `from_sequence` / `to_sequence`、创建时刻各批的**摘要快照**
+   （序号、`batch_id`、`previous_digest`、`digest`、条数）与
+   `library_version`。之后归档清空批次明细不改变已保存的来源。
+
+```bash
+DEV=http://localhost:8000/field-devices/dev-01
+
+# 已上传 seq1..seq3 的链式批次后（每批四项阈值相同）：
+curl -s -X POST $DEV/range-judgments \
+  -H 'Content-Type: application/json' \
+  -d '{"from_sequence": 1, "to_sequence": 3,
+       "idempotency_key": "dev-01-seq1-3-2026-10-01"}' | python3 -m json.tool
+```
+
+```json
+{
+  "status": "matched",
+  "reason": null,
+  "library_source": "stored",
+  "library_version": 1,
+  "observation_count": 11,
+  "parameters": {"tolerance": 0.5, "max_drift": 0.0005,
+                 "max_missed": 3, "max_false": 3},
+  "best": {"aid_id": "CN-001", "drift": 0.00012, "matched": 11, "…": "…"},
+  "candidates": [ …与 /judge 相同的候选摘要… ],
+  "judgment_id": 14,
+  "inspection": {
+    "inspection_id": 1,
+    "device_id": "dev-01",
+    "from_sequence": 1,
+    "to_sequence": 3,
+    "idempotency_key": "dev-01-seq1-3-2026-10-01",
+    "batch_count": 3,
+    "observation_count": 11,
+    "created_at": "2026-10-01T06:00:00+00:00",
+    "batches": [
+      {"sequence": 1, "batch_id": "b-001", "previous_digest": "",
+       "digest": "49740f…", "observation_count": 3},
+      {"sequence": 2, "batch_id": "b-002", "previous_digest": "49740f…",
+       "digest": "5e7aa3…", "observation_count": 4},
+      {"sequence": 3, "batch_id": "b-003", "previous_digest": "5e7aa3…",
+       "digest": "8c2f91…", "observation_count": 4}
+    ]
+  }
+}
+```
+
+- **幂等**：携带**客户端幂等键**。相同键（同设备同范围）重试返回**原判定**，
+  HTTP 200，`judgment_id` / `inspection_id` / 创建时刻均不变，不重复计算、
+  不重复落库；
+- **改范围或设备返回 409**：同一个键已被另一设备或另一序号范围的判定占用时，
+  返回 409，`detail` 给出 `occupied_device_id` / `occupied_from_sequence` /
+  `occupied_to_sequence` / `occupied_by_judgment`，换一个键即可；
+- **整体拒绝不落判定**：范围缺批次、含墓碑、阈值不一致三类校验都在写入前
+  完成，失败时不产生任何 `judgments` 或来源记录（可在补传批次、换用明细仍在
+  的范围后用同键或新键重试）；
+- **并发安全**：创建与批次上传、消费者确认、归档共用同一写锁串行点
+  （`BEGIN IMMEDIATE`），唯一约束兜底同键并发——归档不可能在判定进行中清空
+  范围内明细，已保存的来源记录永远引用完整范围；同键并发恰好一份 201，
+  其余得到同一份 200；
+- **查询**：
+
+```bash
+# 分页列出设备的巡检判定摘要（游标 after_inspection_id 取上一页 next_cursor）
+curl -s "$DEV/range-judgments?limit=50"
+
+# 单条详情：完整 /judge 裁决 + 不可变来源（设备/范围/各批摘要/版本）
+curl -s "$DEV/range-judgments/1"
+```
+
+判定也照常出现在 `GET /judgments` 与 `GET /judgments/{id}` 中（列表与详情
+新增 `source` 字段：普通 `/judge` 为 `"judge"`，连续批次巡检判定为
+`"inspection"`）。
+
 ## 判定模型与裁决规则
 
 **观测模型**：观测时钟相对真时存在线性钟漂与固定相位差，
@@ -794,7 +907,7 @@ t_obs ≈ (1 + drift) · T_true + c
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 前缀归档 + 草稿回放共 107 例）
+pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 前缀归档 + 草稿回放 + 连续批次巡检判定共 127 例）
 uvicorn app.main:app --reload   # 本地起服务，默认使用 ./data/navlight.db
 ```
 
@@ -807,10 +920,12 @@ app/
   patrol.py  巡检整体核对：窗口合格候选 + 全局最优分配动态规划
   replay.py  草稿回放：用草稿快照沿用原观测/阈值重放历史判定并四分类
   batches.py 现场设备批次：规范化载荷与 SHA-256 链式摘要
+  inspections.py 连续批次巡检判定：跨批按 (captured_at, sequence, local_id)
+             合并观测并复用 /judge 规则
   models.py  请求数据模型（Pydantic）
   db.py      SQLite 持久层（不可变特征库版本 + 判定记录 + 草稿回放报告 +
-             设备批次链 + 多消费者稀疏确认与安全归档水位 + 连续前缀归档墓碑，
-             含首次迁移）
+             设备批次链 + 多消费者稀疏确认与安全归档水位 + 连续前缀归档墓碑 +
+             连续批次巡检判定不可变来源，含首次迁移）
   config.py  环境变量配置
 samples/
   library.json                示例特征库

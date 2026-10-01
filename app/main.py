@@ -11,6 +11,8 @@ from .db import (
     BatchNotFound,
     ConsumerConflict,
     Database,
+    InspectionConflict,
+    NoActiveLibrary,
     ReplayConflict,
     VersionConflict,
     VersionNotFound,
@@ -21,12 +23,14 @@ from .models import (
     BatchAckRequest,
     BatchUploadRequest,
     ConsumerRegisterRequest,
+    InspectionJudgeRequest,
     JudgeRequest,
     LibraryImportRequest,
     PatrolAnalyzeRequest,
     ReplayReportRequest,
     VersionCreateRequest,
 )
+from .inspections import run_inspection
 from .patrol import PatrolWaypoint, analyze_patrol
 from .replay import CLASSIFICATIONS, replay_records
 
@@ -52,8 +56,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "草稿上线前可创建回放报告：冻结判定水位，用草稿快照重放水位内服务端"
             "库判定并四分类（unchanged/match_gained/match_lost/winner_changed），"
             "幂等键重试返回原报告、跨版本占用返回 409，回放不写入 judgments。"
+            "归档前可对设备的一段连续批次创建巡检判定：请求开始固定当前激活"
+            "特征库版本，校验序号连续、明细仍在、各批四项阈值完全一致，再按"
+            "(captured_at, sequence, local_id) 合并观测并复用 /judge 规则，"
+            "保存 judgment_id、设备、序号范围、各批摘要与 library_version 为"
+            "不可变来源；幂等键重试返回原判定，改范围或设备 409，范围含墓碑"
+            "或缺批次整体拒绝且不落判定。"
         ),
-        version="1.7.0",
+        version="1.8.0",
     )
     app.state.db = Database(db_path or config.db_path())
 
@@ -582,6 +592,82 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if not created:
             response.status_code = 200
         return body
+
+    # ---------------- 连续批次巡检判定（归档前可复核判定） ----------------
+
+    @app.post(
+        "/field-devices/{device_id}/range-judgments",
+        status_code=201,
+        summary="对设备一段连续批次创建归档前巡检判定（幂等键）",
+        description=(
+            "请求开始即在同一写事务内固定当前激活特征库版本；校验 "
+            "from_sequence..to_sequence 序号连续、每批明细仍在（无归档墓碑）、"
+            "各批保存的 /judge 四项阈值完全一致，再按 "
+            "(captured_at, sequence, local_id) 合并全部观测，复用 /judge 规则"
+            "判定。保存 judgment_id、设备、序号范围、各批摘要与 "
+            "library_version 为不可变来源。相同幂等键重试返回原判定（200）；"
+            "同键改设备或范围返回 409；范围缺批次、含墓碑或阈值不一致整体"
+            "拒绝（409）且不落判定；与上传/归档并发不会让已保存结果引用"
+            "半个范围。"
+        ),
+    )
+    def create_device_range_judgment(
+        req: InspectionJudgeRequest,
+        response: Response,
+        device_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        def runner(stored_aids: list[dict], observations: list[float], thresholds: dict) -> dict:
+            return run_inspection(
+                stored_aids,
+                observations,
+                thresholds,
+                grid_max_steps=config.grid_max_steps(),
+                seed_top_k=config.seed_top_k(),
+            )
+
+        try:
+            body, created = app.state.db.create_inspection_judgment(
+                device_id,
+                req.from_sequence,
+                req.to_sequence,
+                req.idempotency_key,
+                runner,
+            )
+        except NoActiveLibrary as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except InspectionConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        if not created:
+            response.status_code = 200
+        return body
+
+    @app.get(
+        "/field-devices/{device_id}/range-judgments",
+        summary="查询设备的连续批次巡检判定（游标分页，按创建顺序）",
+    )
+    def list_device_range_judgments(
+        device_id: str = Path(min_length=1, max_length=128),
+        after_inspection_id: int = Query(
+            0, ge=0, description="起始游标：返回 inspection_id 大于该值的判定"
+        ),
+        limit: int = Query(50, ge=1, le=200),
+    ) -> dict:
+        return app.state.db.list_inspection_judgments(
+            device_id, after_inspection_id=after_inspection_id, limit=limit
+        )
+
+    @app.get(
+        "/field-devices/{device_id}/range-judgments/{inspection_id}",
+        summary="查询单条连续批次巡检判定详情（含完整裁决与不可变来源）",
+    )
+    def get_device_range_judgment(
+        device_id: str = Path(min_length=1, max_length=128),
+        inspection_id: int = Path(ge=1),
+    ) -> dict:
+        row = app.state.db.get_inspection_judgment(device_id, inspection_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="inspection judgment not found")
+        return row
 
     return app
 

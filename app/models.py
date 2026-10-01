@@ -257,3 +257,32 @@ class ArchiveRequest(BaseModel):
     through_sequence: int = Field(
         ge=1, description="归档目标序号（含）：归档连续前缀 1..through_sequence"
     )
+
+
+class InspectionJudgeRequest(BaseModel):
+    """对设备一段连续批次创建归档前巡检判定。
+
+    请求在开始时固定当前激活特征库版本；服务端确认 ``from_sequence`` 到
+    ``to_sequence`` 的批次序号连续、明细仍在（无墓碑）、每批保存的四项阈值
+    完全一致，再按 ``(captured_at, sequence, local_id)`` 合并观测，复用
+    ``/judge`` 规则判定。相同 ``idempotency_key`` 重试返回原判定；同键改
+    设备或序号范围返回 409；范围缺批次或含墓碑整体拒绝且不落判定。
+    """
+
+    from_sequence: int = Field(ge=1, description="判定范围左端批次序号（含）")
+    to_sequence: int = Field(ge=1, description="判定范围右端批次序号（含）")
+    idempotency_key: str = Field(
+        min_length=1,
+        max_length=128,
+        description="客户端生成的幂等键（全局唯一；同键重试返回原判定）",
+    )
+
+    @model_validator(mode="after")
+    def _range_and_key_valid(self) -> "InspectionJudgeRequest":
+        if self.to_sequence < self.from_sequence:
+            raise ValueError(
+                "to_sequence must be greater than or equal to from_sequence"
+            )
+        if not self.idempotency_key.strip():
+            raise ValueError("idempotency_key must not be blank")
+        return self
